@@ -2,7 +2,9 @@ import ast
 import builtins
 import copy
 import dataclasses
+import hashlib
 import inspect
+import json
 import textwrap
 from collections import deque
 from collections.abc import Callable, Iterable
@@ -1254,3 +1256,168 @@ def parse_workflow(
         edges=edges,
         metadata=metadata,
     )
+
+
+def _subgraph_reaching_target(G: nx.DiGraph, target: str) -> nx.DiGraph:
+    # Step 1: Reverse the graph
+    reversed_G = G.reverse(copy=False)
+
+    # Step 2: Find all nodes that can reach the target
+    nodes_that_reach_target = nx.descendants(reversed_G, target)
+    nodes_that_reach_target.add(target)  # Include T itself
+
+    # Step 3: Induce subgraph on original graph
+    return G.subgraph(nodes_that_reach_target).copy()
+
+
+def hash_graph(G: nx.DiGraph) -> str:
+    """
+    Generate a hash for the given directed graph.
+
+    Args:
+        G (nx.DiGraph): The directed graph to hash.
+
+    Returns:
+        str: A hash string representing the graph.
+    """
+    node_data = sorted((n, dict(G.nodes[n])) for n in G.nodes)
+    edge_data = sorted((u, v, dict(d)) for u, v, d in G.edges(data=True))
+    payload = {
+        "directed": G.is_directed(),
+        "multigraph": G.is_multigraph(),
+        "nodes": node_data,
+        "edges": edge_data,
+    }
+    json_str = json.dumps(payload, sort_keys=True)
+    return "flowrep_" + hashlib.sha256(json_str.encode("utf-8")).hexdigest()
+
+
+def _get_hash_dict(edges: list[tuple[str, str]]) -> dict[str, str]:
+    """
+    Generate a hash dictionary for the edges of a workflow.
+
+    Args:
+        edges (list[tuple[str, str]]): A list of edges in the workflow.
+
+    Returns:
+        dict[str, str]: A dictionary mapping output ports to their corresponding graph hashes.
+    """
+    missing_edges = [list(edge) for edge in _get_missing_edges(edges)]
+    all_edges = sorted(edges + missing_edges)
+    G = nx.DiGraph(all_edges)
+
+    unique_ports = set(port for edge in all_edges for port in edge)
+    output_ports = [
+        port
+        for port in unique_ports
+        if len(port.split(".")) > 2 and port.split(".")[-2] == "outputs"
+    ]
+
+    hash_dict = {}
+    for output_port in output_ports:
+        subG = _subgraph_reaching_target(G, output_port)
+        hash_dict[output_port] = hash_graph(subG)
+
+    available_keys = list(hash_dict.keys())
+
+    for edges in all_edges:
+        if edges[0] in available_keys:
+            hash_dict[edges[1]] = hash_dict[edges[0]]
+
+    return hash_dict
+
+
+def _replace_input_ports(
+    edges: list[tuple[str, str]], inputs: dict[str, dict]
+) -> list[tuple[str, str]]:
+    """
+    Replace input ports in the edges with their corresponding values from the inputs dictionary.
+
+    Args:
+        edges (list[tuple[str, str]]): A list of edges in the workflow.
+        inputs (dict[str, dict]): A dictionary containing input ports and their values.
+
+    Returns:
+        list[tuple[str, str]]: A list of edges with input ports replaced by their values.
+    """
+    edges = [list(edge) for edge in edges]
+    for edge in edges:
+        arg = edge[0].split(".")[-1]
+        if edge[0].startswith("inputs") and arg in inputs:
+            if "value" in inputs[arg]:
+                edge[0] = str(inputs[arg]["value"])
+            elif "default" in inputs[arg]:
+                edge[0] = str(inputs[arg]["default"])
+    return edges
+
+
+def separate_data(
+    workflow_dict: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Separate the data from the workflow dictionary.
+
+    Args:
+        workflow_dict (dict[str, Any]): The workflow dictionary to process.
+
+    Returns:
+        tuple[dict[str, Any], dict[str, Any]]: A tuple containing:
+            - dict[str, Any]: The modified workflow dictionary with updated edges and nodes.
+            - dict[str, Any]: The extracted data dictionary, mapping hash keys to their corresponding data values.
+    """
+    workflow_dict = copy.deepcopy(workflow_dict)
+    edges = _replace_input_ports(workflow_dict["edges"], workflow_dict["inputs"])
+    hash_dict = _get_hash_dict(edges)
+    data_dict = {}
+    for key, hash_data in hash_dict.items():
+        try:
+            if not key.startswith("outputs") and not key.startswith("inputs"):
+                key = "nodes." + key
+            value = _get_entry(workflow_dict, key + ".value")
+            _set_entry(workflow_dict, key + ".value", hash_data)
+            data_dict[hash_data] = value
+        except KeyError:
+            pass
+    return workflow_dict, data_dict
+
+
+def _get_entry(data: dict[str, Any], key: str) -> Any:
+    """
+    Get a value from a nested dictionary at the specified key path.
+
+    Args:
+        data (dict[str, Any]): The dictionary to search.
+        key (str): The key path to retrieve the value from, separated by dots.
+
+    Returns:
+        Any: The value at the specified key path.
+
+    Raises:
+        KeyError: If the key path does not exist in the dictionary.
+    """
+    for item in key.split("."):
+        data = data[item]
+    return data
+
+
+def _set_entry(
+    data: dict[str, Any], key: str, value: Any, create_missing: bool = False
+) -> None:
+    """
+    Set a value in a nested dictionary at the specified key path.
+
+    Args:
+        data (dict[str, Any]): The dictionary to modify.
+        key (str): The key path to set the value at, separated by dots.
+        value (Any): The value to set.
+        create_missing (bool): Whether to create missing keys in the path.
+    """
+    keys = key.split(".")
+    for k in keys[:-1]:
+        if k not in data:
+            if create_missing:
+                data[k] = {}
+            else:
+                raise KeyError(f"Key '{k}' not found in data.")
+        data = data[k]
+    data[keys[-1]] = value
